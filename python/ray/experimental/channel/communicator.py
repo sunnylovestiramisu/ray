@@ -44,7 +44,7 @@ class Communicator(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_rank(self, actor: ray.actor.ActorHandle) -> int:
+    def get_rank(self, actor: "ray.actor.ActorHandle") -> int:
         """
         Return the given actor's rank in the group.
 

@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import ray
 from ray._private.accelerators import TPUAcceleratorManager
@@ -18,6 +18,9 @@ from ray.util.placement_group import (
     placement_group,
     remove_placement_group,
 )
+
+if TYPE_CHECKING:
+    import jax
 
 logger = logging.getLogger(__name__)
 
@@ -668,3 +671,35 @@ def slice_placement_group(
         num_slices=num_slices,
         **kwargs,
     )
+
+
+_global_id_to_device_cache: Dict[int, "jax.Device"] = {}
+
+
+def get_local_device_from_global_id(global_id: int) -> Optional["jax.Device"]:
+    """
+    Get the local JAX device object from its global ID.
+    """
+    global _global_id_to_device_cache
+    if not _global_id_to_device_cache:
+        try:
+            import jax
+
+            _global_id_to_device_cache = {d.id: d for d in jax.devices()}
+        except ImportError:
+            return None
+
+    return _global_id_to_device_cache.get(global_id)
+
+
+def get_tpu_device_ids(_):
+    """This function will be shipped to the actor to be executed."""
+    try:
+        import jax
+
+        device_ids = [d.id for d in jax.local_devices()]
+        log_message = f"!!! device_ids on jax is {device_ids}!!!"
+        print(log_message)
+        return device_ids
+    except (ImportError, IndexError):
+        return []

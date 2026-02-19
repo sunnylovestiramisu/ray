@@ -1,8 +1,10 @@
 from dataclasses import dataclass
-from typing import List
+from typing import TYPE_CHECKING, List
 
-import ray
 from ray.util.collective.types import Backend
+
+if TYPE_CHECKING:
+    from ray.actor import ActorHandle
 
 
 @dataclass
@@ -26,7 +28,7 @@ class CommunicatorHandle:
     actors in the communicator.
     """
 
-    def __init__(self, actors: List[ray.actor.ActorHandle], name: str, backend: str):
+    def __init__(self, actors: List["ActorHandle"], name: str, backend: str):
         """
         Initializes the CommunicatorHandle with the given actor handles.
         Assumes that the communicator has already been initialized on all actors.
@@ -41,14 +43,14 @@ class CommunicatorHandle:
         self._name = name
         self._backend = Backend(backend)
 
-    def get_rank(self, actor: ray.actor.ActorHandle):
+    def get_rank(self, actor: "ActorHandle"):
         for i, a in enumerate(self._actors):
             if a == actor:
                 return i
         return -1
 
     @property
-    def actors(self) -> List[ray.actor.ActorHandle]:
+    def actors(self) -> List["ActorHandle"]:
         """
         Return all actor handles in this communicator.
         """

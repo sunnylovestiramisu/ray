@@ -183,8 +183,8 @@ class ChannelInterface:
 
     def __init__(
         self,
-        writer: Optional[ray.actor.ActorHandle],
-        readers: List[Optional[ray.actor.ActorHandle]],
+        writer: Optional["ray.actor.ActorHandle"],
+        readers: List[Optional["ray.actor.ActorHandle"]],
         typ: Optional["ChannelOutputType"],
     ):
         """

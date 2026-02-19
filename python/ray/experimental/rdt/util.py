@@ -1,3 +1,4 @@
+import importlib.util
 import threading
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional
 
@@ -15,6 +16,7 @@ from ray.experimental.rdt.tensor_transport_manager import (
     TensorTransportManager,
     TensorTransportMetadata,
 )
+from ray.experimental.tpu_transport import JaxTransport
 from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
@@ -84,9 +86,14 @@ def register_tensor_transport(
         has_custom_transports = True
 
 
-DEFAULT_TRANSPORTS = ["NIXL", "GLOO", "NCCL", "CUDA_IPC"]
+DEFAULT_TRANSPORTS = ["NIXL", "GLOO", "NCCL", "CUDA_IPC", "TPU_JAX"]
 
 _default_transports_registered = False
+
+# 1. Safely check if JAX is installed
+# This evaluates to True if JAX is installed, and False if it isn't.
+# It does NOT import JAX into memory
+_should_register_jax = importlib.util.find_spec("jax") is not None
 
 
 def _ensure_default_transports_registered():
@@ -95,6 +102,18 @@ def _ensure_default_transports_registered():
         if _default_transports_registered:
             return
         _default_transports_registered = True
+
+        # 2. Safely register TPU_JAX only if the import succeeded
+        if _should_register_jax:
+            try:
+                import jaxlib
+
+                register_tensor_transport(
+                    "TPU_JAX", ["tpu", "cpu"], JaxTransport, jaxlib._jax.ArrayImpl
+                )
+            except ImportError:
+                pass
+
         try:
             import torch
 
@@ -195,7 +214,12 @@ def device_match_transport(device: str, tensor_transport: str) -> bool:
     if tensor_transport not in transport_manager_info:
         raise ValueError(f"Unsupported tensor transport protocol: {tensor_transport}")
 
-    return device in transport_manager_info[tensor_transport].devices
+    supported_devices = transport_manager_info[tensor_transport].devices
+    # The device name for TPUs can include the version, so we check if the
+    # device name starts with "tpu"
+    return device in supported_devices or (
+        device.lower().startswith("tpu") and "tpu" in supported_devices
+    )
 
 
 def normalize_and_validate_tensor_transport(tensor_transport: str) -> str:
