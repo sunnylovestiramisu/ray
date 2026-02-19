@@ -4,8 +4,24 @@ site packages.
 """
 
 import sys
+from dataclasses import asdict, dataclass
 
 from ray.util.annotations import DeveloperAPI
+
+
+@dataclass
+class JAXTPUTransportMetadata:
+    # Required to allocate the destination buffer
+    shape: tuple
+    dtype: str
+
+    # Required for Actor B to call device_put on the CORRECT local chip
+    receiver_global_device_id: int
+    # Required for Actor B to call device_put on the CORRECT local chip
+    sender_global_device_id: int
+
+    # Required for Ray to match the 'Ready-to-Receive' signal to the right task
+    transfer_uuid: str
 
 
 @DeveloperAPI
@@ -25,11 +41,27 @@ def register_starlette_serializer(serialization_context):
 
 
 @DeveloperAPI
+def register_jax_serializer(serialization_context):
+    try:
+        # Check if jax is available.
+        import jax  # noqa: F401
+    except ImportError:
+        return
+
+    serialization_context._register_cloudpickle_serializer(
+        JAXTPUTransportMetadata,
+        custom_serializer=asdict,
+        custom_deserializer=lambda d: JAXTPUTransportMetadata(**d),
+    )
+
+
+@DeveloperAPI
 def apply(serialization_context):
     from ray._common.pydantic_compat import register_pydantic_serializers
 
     register_pydantic_serializers(serialization_context)
     register_starlette_serializer(serialization_context)
+    register_jax_serializer(serialization_context)
 
     if sys.platform != "win32":
         from ray._private.arrow_serialization import (

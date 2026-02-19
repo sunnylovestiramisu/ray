@@ -1,6 +1,8 @@
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+import os
+import threading
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import ray
 from ray._private.accelerators import TPUAcceleratorManager
@@ -17,6 +19,12 @@ from ray.util.placement_group import (
     placement_group,
     remove_placement_group,
 )
+from ray.util.tpu import (
+    get_local_device_from_global_id,
+)
+
+if TYPE_CHECKING:
+    import jax
 
 logger = logging.getLogger(__name__)
 
@@ -491,3 +499,165 @@ def slice_placement_group(
         num_slices=num_slices,
         **kwargs,
     )
+
+
+@PublicAPI(stability="alpha")
+def get_tpu_devices() -> List["jax.Device"]:
+    """Returns a list of JAX TPU devices visible to the worker."""
+    try:
+        import jax
+
+        return jax.devices("tpu")
+    except (ImportError, RuntimeError):
+        return []
+
+
+@PublicAPI(stability="alpha")
+def get_global_device_id_from_actor(actor: "ray.actor.ActorHandle") -> int:
+    """
+    Get the global JAX device ID of the TPU device assigned to the actor.
+
+    This function executes a remote task on the specified actor to retrieve the
+    ID of the first JAX TPU device available to that actor.
+
+    Args:
+        actor: The Ray actor handle to get the device ID from.
+
+    Returns:
+        The global JAX device ID.
+    """
+
+    @ray.remote(num_cpus=0)
+    def get_id():
+        try:
+            import jax
+
+            return jax.devices()[0].id
+        except (ImportError, IndexError):
+            return -1
+
+    return ray.get(get_id.options(actor=actor).remote())
+
+
+@PublicAPI(stability="alpha")
+def get_local__from_global_id(global_id: int) -> Optional["jax.Device"]:
+    """
+    Get the local JAX device object from its global ID.
+
+    This function is intended to be called on a worker to find the specific
+    JAX device that corresponds to a global ID.
+
+    Args:
+        global_id: The global JAX device ID to look for.
+
+    Returns:
+        The `jax.Device` object if found, otherwise None.
+    """
+    try:
+        import jax
+
+        for device in jax.devices():
+            if device.id == global_id:
+                return device
+        return None
+    except ImportError:
+        return None
+
+
+# Global registry to prevent Python GC from releasing HBM mid-transfer
+_PINNED_BUFFERS = {}
+_TRANSPORT_CONTEXT = threading.local()
+
+
+def is_tpu_transport_enabled():
+    return getattr(_TRANSPORT_CONTEXT, "enabled", False)
+
+
+def get_current_task_target_device_id():
+    return getattr(_TRANSPORT_CONTEXT, "target_device_id", 0)
+
+
+def register_send_buffer(transfer_uuid, array):
+    """Step 1: Keep the reference alive for the ICI hardware stream."""
+    _PINNED_BUFFERS[transfer_uuid] = array
+
+
+def release_send_buffer(transfer_uuid):
+    """Step 5: Hardware ACK received. Safe to let GC reclaim HBM."""
+    if transfer_uuid in _PINNED_BUFFERS:
+        del _PINNED_BUFFERS[transfer_uuid]
+        logger.debug(f"Released TPU buffer for transfer {transfer_uuid}")
+
+
+@PublicAPI(stability="alpha")
+def get_jax_distributed_metadata() -> Optional[str]:
+    """Gets JAX distributed metadata from environment variables."""
+    return os.environ.get("MEGASCALE_COORDINATOR_ADDRESS")
+
+
+@PublicAPI(stability="alpha")
+def initialize_jax_distributed(num_processes, process_id, coordinator_address=None):
+    """
+    Sets up the JAX Control Plane.
+    """
+    try:
+        import jax
+
+        if jax.distributed.global_state is not None:
+            return  # Safety check: JAX can only be initialized once per process
+
+        # If the user didn't provide an address, we perform the discovery
+        if coordinator_address is None:
+            coordinator_address = get_jax_distributed_metadata()
+
+        # The actual JAX call that starts the distributed state machine
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=num_processes,
+            process_id=process_id,
+            # initialization_timeout is key for large TPU slices
+            initialization_timeout=300,
+        )
+        print(f"JAX Distributed Initialized: Process {process_id}/{num_processes}")
+    except ImportError:
+        logger.warning(
+            "Could not initialize JAX distributed because jax is not installed."
+        )
+
+
+@PublicAPI(stability="alpha")
+def redeem_tpu_transfer(metadata):
+    """
+    Step 4: Called by Actor B to finalize the ICI move.
+    Both actors are now calling device_put simultaneously.
+    """
+    try:
+        import jax
+
+        # Identify the specific local chip intended for this data
+        target_device = get_local_device_from_global_id(
+            metadata.receiver_global_device_id
+        )
+        if target_device is None:
+            raise ValueError(
+                "redeem_tpu_transfer: target device not found on this host."
+            )
+
+        # For a point-to-point move, the sharding of the receiving array
+        # is a single device sharding on the target device.
+        sharding = jax.sharding.SingleDeviceSharding(target_device)
+
+        # Handle the 'No Local Shards' case.
+        # On the receiving side, we pass an empty list of arrays to
+        # make_array_from_single_device_arrays.
+        xs = []
+
+        arr = jax.make_array_from_single_device_arrays(
+            shape=metadata.shape, sharding=sharding, arrays=xs, dtype=metadata.dtype
+        )
+
+        # Trigger the collective handshake.
+        return jax.device_put(arr, target_device)
+    except ImportError:
+        logger.warning("Could not redeem TPU transfer because jax is not installed.")
+        return None
