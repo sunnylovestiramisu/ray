@@ -15,6 +15,7 @@ from ray.experimental.rdt.tensor_transport_manager import (
     TensorTransportManager,
     TensorTransportMetadata,
 )
+from ray.experimental.tpu_transport import JaxTransport
 from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
@@ -84,7 +85,7 @@ def register_tensor_transport(
         has_custom_transports = True
 
 
-DEFAULT_TRANSPORTS = ["NIXL", "GLOO", "NCCL", "CUDA_IPC"]
+DEFAULT_TRANSPORTS = ["NIXL", "GLOO", "NCCL", "CUDA_IPC", "TPU_JAX"]
 
 _default_transports_registered = False
 
@@ -112,6 +113,15 @@ def _ensure_default_transports_registered():
             )
         except ImportError:
             pass
+
+    try:
+        import jaxlib
+
+        register_tensor_transport(
+            "TPU_JAX", ["tpu", "cpu"], JaxTransport, jaxlib._jax.ArrayImpl
+        )
+    except ImportError:
+        pass
 
 
 def get_transport_data_type(tensor_transport: str) -> type:
@@ -195,7 +205,12 @@ def device_match_transport(device: str, tensor_transport: str) -> bool:
     if tensor_transport not in transport_manager_info:
         raise ValueError(f"Unsupported tensor transport protocol: {tensor_transport}")
 
-    return device in transport_manager_info[tensor_transport].devices
+    supported_devices = transport_manager_info[tensor_transport].devices
+    # The device name for TPUs can include the version, so we check if the
+    # device name starts with "tpu"
+    if "tpu" in supported_devices and device and device.lower().startswith("tpu"):
+        return True
+    return device in supported_devices
 
 
 def normalize_and_validate_tensor_transport(tensor_transport: str) -> str:

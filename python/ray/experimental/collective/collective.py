@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 import ray
 import ray.experimental.internal_kv as internal_kv
 from ray.experimental.collective.communicator import CommunicatorHandle
+from ray.util import tpu as tpu_utils
 from ray.util.annotations import PublicAPI
 from ray.util.collective.collective_group.torch_gloo_collective_group import (
     get_master_address_metadata_key,
@@ -131,6 +132,15 @@ def create_collective_group(
     if backend == Backend.GLOO:
         metadata_key = get_master_address_metadata_key(name)
 
+    if backend == Backend.JAX_TPU:
+        # Populate the driver-side cache
+        print("!!! Called create_collective_group for JAX_TPU !!!")
+        _populate_tpu_cache(actors)
+        print(
+            f"!!! _actor_to_device_ids_cache in create_collective_group is {tpu_utils._actor_to_device_ids_cache} !!!"
+        )
+        return
+
     def _do_init_collective_group(self, rank: int):
         ray.util.collective.init_collective_group(
             world_size, rank, backend, group_name=name
@@ -207,3 +217,30 @@ def destroy_all_collective_groups():
     manager = RemoteCommunicatorManager.get()
     for collective in manager.get_collective_groups():
         destroy_collective_group(collective.name)
+
+
+def _populate_tpu_cache(workers):
+    """
+    Standalone helper to fetch and cache TPU device IDs for a list of workers.
+    Runs entirely on the driver process.
+    """
+    # Concurrently fetch TPU device IDs from all workers
+    futures = [
+        worker.__ray_call__.remote(lambda self: tpu_utils.get_all_ids_for_actor(self))
+        for worker in workers
+    ]
+
+    # Wait for all workers to return their device IDs
+    device_ids_list = ray.get(futures)
+
+    # Safely write the results to the driver's global cache
+    with tpu_utils._cache_lock:
+        for worker, device_ids in zip(workers, device_ids_list):
+            actor_id = worker._actor_id.hex()
+
+            # This mutates the dictionary that is shared across the entire Ray driver
+            tpu_utils._actor_to_device_ids_cache[actor_id] = device_ids
+
+    print(
+        f"Successfully populated tpu_utils cache: {tpu_utils._actor_to_device_ids_cache}"
+    )

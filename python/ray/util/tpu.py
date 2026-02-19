@@ -1,6 +1,7 @@
 import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import ray
 from ray._private.accelerators import TPUAcceleratorManager
@@ -19,7 +20,14 @@ from ray.util.placement_group import (
     remove_placement_group,
 )
 
+if TYPE_CHECKING:
+    import jax
+
 logger = logging.getLogger(__name__)
+
+# Cache for actor ID to TPU device ID mapping. This is a process-local cache.
+_actor_to_device_ids_cache: Dict[str, List[int]] = {}
+_cache_lock = threading.Lock()
 
 
 @PublicAPI(stability="alpha")
@@ -612,3 +620,91 @@ def slice_placement_group(
         num_slices=num_slices,
         **kwargs,
     )
+
+
+@PublicAPI(stability="alpha")
+def get_local_device_from_global_id(global_id: int) -> Optional["jax.Device"]:
+    """
+    Get the local JAX device object from its global ID.
+
+    This function is intended to be called on a worker to find the specific
+    JAX device that corresponds to a global ID.
+
+    Args:
+        global_id: The global JAX device ID to look for.
+
+    Returns:
+        The `jax.Device` object if found, otherwise None.
+    """
+    print(f"!!! Calling get_local_device_from_global_id {global_id}!!!")
+    try:
+        import jax
+
+        for device in jax.devices():
+            print(f"!!! Current device is {device} !!!")
+            if device.id == global_id:
+                return device
+        return None
+    except ImportError:
+        return None
+
+
+def get_all_ids_for_actor(_):
+    """This function will be shipped to the actor to be executed."""
+    try:
+        import jax
+
+        device_ids = [d.id for d in jax.local_devices()]
+        log_message = f"!!! device_ids on jax is {device_ids}!!!"
+        print(log_message)
+        return device_ids
+    except (ImportError, IndexError):
+        return []
+
+
+@PublicAPI(stability="alpha")
+def get_all_local_device_ids_from_actor(actor: "ray.actor.ActorHandle") -> List[int]:
+    """
+    Get all local JAX device IDs of the TPU devices assigned to the actor
+    by reading from the process-local cache.
+    This function assumes the cache has already been populated.
+    Args:
+        actor: The Ray actor handle to get the device IDs from.
+    Returns:
+        A list of global JAX device IDs.
+    Raises:
+        KeyError: if the actor ID is not found in the cache.
+    """
+    # Using actor._actor_id.hex() is a reliable way to get a unique string key.
+    print(f"!!! get_all_local_device_ids_from_actor for actor {actor}!!!")
+    print(f"!!! _actor_to_device_ids_cache cache is {_actor_to_device_ids_cache}!!!")
+    actor_id_str = actor._actor_id.hex()
+    with _cache_lock:
+        # The cache is expected to be primed, so we read directly.
+        # This will raise a KeyError if the actor ID is not found,
+        # which is desirable to indicate that the cache was not primed.
+        device_ids = _actor_to_device_ids_cache[actor_id_str]
+        print(f"!!! Return cached devices {device_ids} for actor {actor}!!!")
+        return device_ids
+
+
+@PublicAPI(stability="alpha")
+def get_global_device_id_from_actor(actor: "ray.actor.ActorHandle") -> int:
+    """
+    Get the global JAX device ID of the TPU device assigned to the actor.
+    This function executes a remote task on the specified actor to retrieve the
+    ID of the first JAX TPU device available to that actor.
+    It uses a process-local cache to avoid repeated remote calls.
+    Args:
+        actor: The Ray actor handle to get the device ID from.
+    Returns:
+        The global JAX device ID.
+    """
+    actor_id_str = actor._actor_id.hex()
+    with _cache_lock:
+        # The cache is expected to be primed, so we read directly.
+        # This will raise a KeyError if the actor ID is not found,
+        # which is desirable to indicate that the cache was not primed.
+        device_ids = _actor_to_device_ids_cache[actor_id_str]
+        print(f"!!! Return cached devices {device_ids} for actor {actor}!!!")
+        return device_ids[0]
