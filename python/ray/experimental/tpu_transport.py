@@ -127,6 +127,8 @@ class JaxTransport(TensorTransportManager):
     ) -> List["jax.Array"]:
         import jax
 
+        print(f"!!! target_buffers: {target_buffers} !!!", flush=True)
+
         tensors = []
         meta = tensor_transport_metadata
 
@@ -139,7 +141,7 @@ class JaxTransport(TensorTransportManager):
                 tuple(meta.partition_spec),
             )
 
-            tensors = jax.device_put(target_buffers, local_sharding)
+            tensors = jax.device_put(None, local_sharding)
 
             # Wait for hardware dispatch.
             jax.block_until_ready(tensors)
