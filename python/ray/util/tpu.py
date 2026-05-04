@@ -690,10 +690,13 @@ def slice_placement_group(
     )
 
 
-def get_tpu_device_ids(_):
+def get_tpu_device_ids():
     try:
         import jax
 
+        """ Return the device IDs for TPUs attached to the current local process.
+        The IDs returned are the local TPU devices or "cores" on the current host.
+        """
         device_ids = [d.id for d in jax.local_devices()]
         return device_ids
     except (ImportError, IndexError):

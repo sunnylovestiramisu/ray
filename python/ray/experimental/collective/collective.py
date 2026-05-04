@@ -241,6 +241,11 @@ def get_all_local_device_ids_from_actor(actor: ray.actor.ActorHandle) -> List[in
     """
     # Using actor._actor_id.hex() is a reliable way to get a unique string key.
     actor_id_str = actor._actor_id.hex()
+    if actor_id_str not in _actor_to_device_ids_cache:
+        raise RuntimeError(
+            f"TPU device IDs for actor {actor_id_str} not found in cache. "
+            "Ensure the actor has been added to a JAX collective group before calling this API."
+        )
     with _cache_lock:
         # The cache is expected to be primed, so we read directly.
         device_ids = _actor_to_device_ids_cache[actor_id_str]
@@ -260,9 +265,19 @@ def get_global_device_id_from_actor(actor: ray.actor.ActorHandle) -> int:
         The global JAX device ID.
     """
     actor_id_str = actor._actor_id.hex()
+    if actor_id_str not in _actor_to_device_ids_cache:
+        raise RuntimeError(
+            f"TPU device IDs for actor {actor_id_str} not found in cache. "
+            "Ensure the actor has been added to a JAX collective group before calling this API."
+        )
     with _cache_lock:
         # The cache is expected to be primed, so we read directly.
         device_ids = _actor_to_device_ids_cache[actor_id_str]
+        if not device_ids:
+            raise RuntimeError(
+                f"Actor {actor._actor_id.hex()} has no TPU devices assigned. "
+                "Ensure the actor is scheduled on a machine with TPU hardware."
+            )
         return device_ids[0]
 
 
@@ -270,10 +285,12 @@ def _populate_tpu_cache(actors):
     """
     Standalone helper to fetch and cache TPU device IDs for a list of actors.
     Runs entirely on the driver process.
+    We assume that each node is controlled by a single actor, and this actor
+    has exclusive access to all local devices on that node.
     """
     # Concurrently fetch TPU device IDs from all actors
     futures = [
-        actor.__ray_call__.remote(lambda self: tpu_utils.get_tpu_device_ids(self))
+        actor.__ray_call__.remote(lambda _: tpu_utils.get_tpu_device_ids())
         for actor in actors
     ]
 

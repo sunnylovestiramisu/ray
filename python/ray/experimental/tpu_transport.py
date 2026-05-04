@@ -82,7 +82,7 @@ class JaxTransport(TensorTransportManager):
         try:
             device_ids = get_all_local_device_ids_from_actor(actor)
             return len(device_ids) > 0
-        except (KeyError, ValueError):
+        except RuntimeError:
             return False
 
     def extract_tensor_transport_metadata(
@@ -114,12 +114,9 @@ class JaxTransport(TensorTransportManager):
     ) -> JaxCommunicatorMetadata:
         from ray.experimental.collective import get_all_local_device_ids_from_actor
 
-        try:
-            return JaxCommunicatorMetadata(
-                dst_device_ids=get_all_local_device_ids_from_actor(dst_actor),
-            )
-        except KeyError as e:
-            raise RuntimeError(f"TPU devices cache not primed for actor {e}") from e
+        return JaxCommunicatorMetadata(
+            dst_device_ids=get_all_local_device_ids_from_actor(dst_actor),
+        )
 
     def recv_multiple_tensors(
         self,
