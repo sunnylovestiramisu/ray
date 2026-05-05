@@ -125,13 +125,12 @@ class JaxTransport(TensorTransportManager):
         communicator_metadata: JaxCommunicatorMetadata,
         target_buffers: Optional[List["jax.Array"]] = None,
     ) -> List["jax.Array"]:
-        import jax
 
         print(f"!!! target_buffers: {target_buffers} !!!", flush=True)
 
         tensors = []
         meta = tensor_transport_metadata
-
+        print(f"!!! meta: {meta} !!!", flush=True)
         if meta.tensor_meta:
             # Always use local hardware for receiving coordination.
             local_sharding = _get_or_create_sharding(
@@ -140,11 +139,11 @@ class JaxTransport(TensorTransportManager):
                 meta.mesh_axis_names,
                 tuple(meta.partition_spec),
             )
-
-            tensors = jax.device_put(None, local_sharding)
+            print(f"!!! local_sharding: {local_sharding} !!!", flush=True)
+            # tensors = jax.device_put(None, local_sharding)
 
             # Wait for hardware dispatch.
-            jax.block_until_ready(tensors)
+            # jax.block_until_ready(tensors)
 
         return list(tensors) if isinstance(tensors, (list, tuple)) else [tensors]
 
