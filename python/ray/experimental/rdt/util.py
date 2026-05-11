@@ -98,12 +98,17 @@ def _ensure_default_transports_registered():
 
         # Register JAX if jax is available.
         try:
-            import jax
-
             from ray.experimental.tpu_transport import JaxTransport
 
+            # Modern JAX uses ArrayImpl as the concrete type.
+            # We must register this exact type for CloudPickle to trigger.
+            try:
+                from jaxlib.xla_extension import ArrayImpl
+            except ImportError:
+                from jaxlib._jax import ArrayImpl
+
             register_tensor_transport(
-                "JAX", ["tpu", "gpu", "cpu"], JaxTransport, jax.Array
+                "JAX", ["tpu", "gpu", "cpu"], JaxTransport, ArrayImpl
             )
         except ImportError:
             pass

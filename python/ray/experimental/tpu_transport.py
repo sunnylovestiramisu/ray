@@ -90,6 +90,10 @@ class JaxTransport(TensorTransportManager):
         obj_id: str,
         gpu_object: List["jax.Array"],
     ) -> JaxTransportMetadata:
+        print(
+            f"!!! extract_tensor_transport_metadata for {obj_id[:8]}, count={len(gpu_object)} !!!",
+            flush=True,
+        )
         if not gpu_object:
             return JaxTransportMetadata(tensor_meta=[])
 
@@ -97,14 +101,18 @@ class JaxTransport(TensorTransportManager):
         mesh = sharding.mesh
         tensor_meta = [(t.shape, t.dtype) for t in gpu_object]
 
-        return JaxTransportMetadata(
+        # Convert JAX objects to plain Python types for serialization safety.
+        # sharding.spec is a PartitionSpec, mesh.shape is a Shape object.
+        meta = JaxTransportMetadata(
             tensor_meta=tensor_meta,
-            tensor_device=mesh.devices.flatten()[0].device_kind,
-            mesh_shape=mesh.shape,
-            mesh_axis_names=mesh.axis_names,
-            partition_spec=sharding.spec,
+            tensor_device=str(mesh.devices.flatten()[0].device_kind),
+            mesh_shape=dict(mesh.shape),
+            mesh_axis_names=list(mesh.axis_names),
+            partition_spec=tuple(sharding.spec),
             obj_id=obj_id,
         )
+        print(f"!!! Extracted meta: {meta} !!!", flush=True)
+        return meta
 
     def get_communicator_metadata(
         self,
