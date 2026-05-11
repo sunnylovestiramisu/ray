@@ -345,7 +345,7 @@ class RDTStore:
             if rdt_object.error:
                 raise rdt_object.error
             for tensor in rdt_object.data:
-                self._tensor_to_object_ids[id(tensor)].remove(obj_id)
+                self._tensor_to_object_ids[id(tensor)].discard(obj_id)
                 if len(self._tensor_to_object_ids[id(tensor)]) == 0:
                     self._tensor_to_object_ids.pop(id(tensor))
             self._object_freed_cv.notify_all()

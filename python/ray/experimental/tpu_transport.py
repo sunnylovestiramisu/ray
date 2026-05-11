@@ -49,6 +49,7 @@ def _get_or_create_sharding(
 
 @dataclass
 class JaxCommunicatorMetadata(CommunicatorMetadata):
+    source_device_ids: Optional[List[int]] = None
     dst_device_ids: Optional[List[int]] = None
 
 
@@ -82,7 +83,7 @@ class JaxTransport(TensorTransportManager):
         try:
             device_ids = get_all_local_device_ids_from_actor(actor)
             return len(device_ids) > 0
-        except RuntimeError:
+        except (KeyError, ValueError, RuntimeError):
             return False
 
     def extract_tensor_transport_metadata(
@@ -123,6 +124,7 @@ class JaxTransport(TensorTransportManager):
         from ray.experimental.collective import get_all_local_device_ids_from_actor
 
         return JaxCommunicatorMetadata(
+            source_device_ids=get_all_local_device_ids_from_actor(src_actor),
             dst_device_ids=get_all_local_device_ids_from_actor(dst_actor),
         )
 
@@ -133,6 +135,7 @@ class JaxTransport(TensorTransportManager):
         communicator_metadata: JaxCommunicatorMetadata,
         target_buffers: Optional[List["jax.Array"]] = None,
     ) -> List["jax.Array"]:
+        import jax
 
         print(f"!!! target_buffers: {target_buffers} !!!", flush=True)
 
@@ -147,13 +150,16 @@ class JaxTransport(TensorTransportManager):
                 meta.mesh_axis_names,
                 tuple(meta.partition_spec),
             )
-            print(f"!!! local_sharding: {local_sharding} !!!", flush=True)
-            # tensors = jax.device_put(None, local_sharding)
 
-            # Wait for hardware dispatch.
-            # jax.block_until_ready(tensors)
+            # Create local metadata handles for each expected tensor.
+            for _ in meta.tensor_meta:
+                t = jax.device_put(None, local_sharding)
+                tensors.append(t)
 
-        return list(tensors) if isinstance(tensors, (list, tuple)) else [tensors]
+            # Wait for JAX background coordination to finalize the linkage.
+            jax.block_until_ready(tensors)
+
+        return tensors
 
     def send_multiple_tensors(
         self,
