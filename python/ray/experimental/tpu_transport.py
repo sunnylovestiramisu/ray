@@ -91,10 +91,6 @@ class JaxTransport(TensorTransportManager):
         obj_id: str,
         gpu_object: List["jax.Array"],
     ) -> JaxTransportMetadata:
-        print(
-            f"!!! extract_tensor_transport_metadata for {obj_id[:8]}, count={len(gpu_object)} !!!",
-            flush=True,
-        )
         if not gpu_object:
             return JaxTransportMetadata(tensor_meta=[])
 
@@ -103,7 +99,6 @@ class JaxTransport(TensorTransportManager):
         tensor_meta = [(t.shape, t.dtype) for t in gpu_object]
 
         # Convert JAX objects to plain Python types for serialization safety.
-        # sharding.spec is a PartitionSpec, mesh.shape is a Shape object.
         meta = JaxTransportMetadata(
             tensor_meta=tensor_meta,
             tensor_device=str(mesh.devices.flatten()[0].device_kind),
@@ -112,7 +107,6 @@ class JaxTransport(TensorTransportManager):
             partition_spec=tuple(sharding.spec),
             obj_id=obj_id,
         )
-        print(f"!!! Extracted meta: {meta} !!!", flush=True)
         return meta
 
     def get_communicator_metadata(
@@ -137,26 +131,44 @@ class JaxTransport(TensorTransportManager):
     ) -> List["jax.Array"]:
         import jax
 
-        print(f"!!! target_buffers: {target_buffers} !!!", flush=True)
-
         tensors = []
         meta = tensor_transport_metadata
-        print(f"!!! meta: {meta} !!!", flush=True)
+        comm = communicator_metadata
+
         if meta.tensor_meta:
-            # Always use local hardware for receiving coordination.
+            # 1. Reconstruct shardings for BOTH sides.
+            # We need the source sharding to create the "Ghost" handles.
+            src_sharding = _get_or_create_sharding(
+                comm.source_device_ids,
+                meta.mesh_shape,
+                meta.mesh_axis_names,
+                tuple(meta.partition_spec),
+            )
             local_sharding = _get_or_create_sharding(
-                None,
+                None,  # Local hardware ground truth.
                 meta.mesh_shape,
                 meta.mesh_axis_names,
                 tuple(meta.partition_spec),
             )
 
-            # Create local metadata handles for each expected tensor.
-            for _ in meta.tensor_meta:
-                t = jax.device_put(None, local_sharding)
-                tensors.append(t)
+            # 2. Create "Ghost Arrays" (Real objects, 0 local data).
+            # These handles tell JAX: "I expect data for this shape on the sender's chips."
+            ghost_arrays = []
+            for shape, dtype in meta.tensor_meta:
+                arr_remote = jax.make_array_from_single_device_arrays(
+                    shape=shape,
+                    sharding=src_sharding,
+                    arrays=[],
+                    dtype=dtype,
+                )
+                ghost_arrays.append(arr_remote)
 
-            # Wait for JAX background coordination to finalize the linkage.
+            # 3. Trigger the ICI pull.
+            # JAX sees the ghost arrays and pulls the data to our local chips.
+            jax.block_until_ready(ghost_arrays)
+            tensors = jax.device_put(ghost_arrays, local_sharding)
+
+            # Wait for JAX to finalize the linkage to incoming ICI data.
             jax.block_until_ready(tensors)
 
         return tensors
