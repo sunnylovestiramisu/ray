@@ -3,6 +3,7 @@ exclude: |
     python/ray/core/generated/|
     python/ray/serve/generated/|
     python/ray/experimental/sandbox/http/_proto/.*_(pb2|grpc)\.py|
+    python/ray/experimental/sandbox/_internal/image_provider_pb2(_grpc)?\.py|
     python/ray/cloudpickle/|
     python/ray/dashboard/client/public/|
     python/ray/tests/test_cli_patterns|

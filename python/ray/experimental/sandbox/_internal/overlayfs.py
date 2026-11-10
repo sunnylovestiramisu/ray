@@ -295,6 +295,10 @@ class ImageMountMode(enum.Enum):
     KERNEL = "kernel"
     FUSE = "fuse"
     EXTRACTED = "extracted"
+    # Not an EROFS image at all: a read-only rootfs directory on the host,
+    # such as one an image provider plugin streams, that each sandbox
+    # bind-mounts as its lower layer. Never detected; callers ask for it.
+    DIRECTORY = "directory"
 
     @classmethod
     @functools.lru_cache(maxsize=None)
@@ -457,6 +461,16 @@ class RootfsOverlay:
                 mount_image = [
                     'mount --bind "$image" "$tmpfs/lower"',
                     'mount -o remount,bind,ro,nosuid "$tmpfs/lower"',
+                ]
+            case ImageMountMode.DIRECTORY:
+                # The directory may be a mount itself, or hold mounts, which
+                # a private user namespace may only bind recursively. The
+                # overlay never writes to its lower layer, so the read-only
+                # remount, which a private user namespace may refuse, only
+                # hardens it.
+                mount_image = [
+                    'mount --rbind "$image" "$tmpfs/lower"',
+                    '{ mount -o remount,bind,ro,nosuid "$tmpfs/lower" 2>/dev/null || true; }',
                 ]
             case _:
                 raise ValueError(f"Unknown image mount mode {self.image_mount_mode!r}")
@@ -635,7 +649,9 @@ class RootfsOverlay:
 _PRESTART_HOOKS = ("prestart", "createRuntime", "createContainer")
 
 
-def needs_rootfs_overlay(spec: Dict[str, Any]) -> bool:
+def needs_rootfs_overlay(
+    spec: Dict[str, Any], rootfs_dir: Optional[str] = None
+) -> bool:
     """Whether a sandbox with this final OCI spec boots from a kernel overlay
     over its cached EROFS image, rather than from the image itself.
 
@@ -645,12 +661,29 @@ def needs_rootfs_overlay(spec: Dict[str, Any]) -> bool:
     mount points the image doesn't have. runsc applies no overlay of its own
     to a read-only root, and can't create them in the image, but can in the
     kernel overlay's upper layer.
+
+    Args:
+        spec: The final OCI spec.
+        rootfs_dir: The host directory the sandbox's rootfs comes from, for
+            a streamed image (see ``missing_mount_points``). None for an
+            EROFS image.
     """
     if has_prestart_hooks(spec):
         return True
     if not spec.get("root", {}).get("readonly"):
         return False
-    return len(missing_mount_points(spec)) > 0
+    return len(missing_mount_points(spec, rootfs_dir)) > 0
+
+
+def needs_rootfs_overlay_for_image(
+    spec: Dict[str, Any], rootfs_dir: Optional[str]
+) -> bool:
+    """``needs_rootfs_overlay`` for a sandbox on an EROFS image (``rootfs_dir``
+    None) or a streamed rootfs directory. An EROFS image's check passes only
+    the spec, as it always has."""
+    if rootfs_dir is None:
+        return needs_rootfs_overlay(spec)
+    return needs_rootfs_overlay(spec, rootfs_dir)
 
 
 def has_prestart_hooks(spec: Dict[str, Any]) -> bool:
@@ -660,7 +693,9 @@ def has_prestart_hooks(spec: Dict[str, Any]) -> bool:
     return any(hooks.get(kind) for kind in _PRESTART_HOOKS)
 
 
-def missing_mount_points(spec: Dict[str, Any]) -> List[str]:
+def missing_mount_points(
+    spec: Dict[str, Any], rootfs_dir: Optional[str] = None
+) -> List[str]:
     """The destinations of this OCI spec's mounts that need a mount point in
     the image, which it may not have.
 
@@ -670,19 +705,28 @@ def missing_mount_points(spec: Dict[str, Any]) -> List[str]:
     created in that mount rather than in the image. This doesn't check
     whether the image has any others, so a mount onto a path it does have
     counts too.
-    """
-    # Build a list of available mount points, which every image has. This
-    # includes "/" as well as the directories and files image_utils seeds into
-    # every image at build time.
-    available = {"/"}
-    for path in image_utils._MOUNTPOINT_DIRS + image_utils._MOUNTPOINT_FILES:
-        available.add(os.path.join("/", path))
 
+    A streamed image's rootfs comes from an image provider plugin as is,
+    with nothing seeded, so for one (``rootfs_dir`` given) the mount points
+    it has are the paths that exist in that directory.
+    """
     # Build the list of desired mounts from the spec.
     mounts = []
     for m in spec.get("mounts") or []:
         if m.get("destination"):
             mounts.append(os.path.normpath(m["destination"]))
+
+    # Build a list of available mount points, which every image has. This
+    # includes "/" as well as the directories and files image_utils seeds into
+    # every image at build time.
+    available = {"/"}
+    if rootfs_dir is not None:
+        for m in mounts:
+            if os.path.lexists(os.path.join(rootfs_dir, m.lstrip("/"))):
+                available.add(m)
+    else:
+        for path in image_utils._MOUNTPOINT_DIRS + image_utils._MOUNTPOINT_FILES:
+            available.add(os.path.join("/", path))
 
     # Define a helper function to check if a given mount is inside another
     # mount or not. If it is, its mount point comes from that other mount
@@ -784,11 +828,13 @@ def prepare(
     worker can.
 
     Args:
-        image: The EROFS image the kernel overlay sits on.
+        image: The EROFS image the kernel overlay sits on, or for
+            ``ImageMountMode.DIRECTORY``, the read-only rootfs directory.
         mountpoint: The directory to mount the kernel overlay on.
         bundle_dir: The sandbox's bundle directory.
         userns: The type of user namespace to mount it in. Detected if not given.
         image_mount_mode: How to mount the EROFS image. Detected if not given.
+            Pass ``ImageMountMode.DIRECTORY`` when ``image`` is a directory.
         extract_timeout_seconds: Timeout for extracting the image rootfs,
             in seconds. Defaults to 600; mount probes use 30.
 
@@ -811,7 +857,11 @@ def prepare(
     # can't.
     if userns is None:
         userns = UserNamespaceType.detect()
-    if image_mount_mode is None:
+    if image_mount_mode is ImageMountMode.DIRECTORY:
+        # Binding a directory needs no EROFS support, but the same mount
+        # privileges as the other modes, which detect checks once per process.
+        ImageMountMode.detect(userns)
+    elif image_mount_mode is None:
         image_mount_mode = ImageMountMode.detect(userns)
     if image_mount_mode is ImageMountMode.EXTRACTED:
         image = _extract_image_rootfs(image, timeout_seconds=extract_timeout_seconds)

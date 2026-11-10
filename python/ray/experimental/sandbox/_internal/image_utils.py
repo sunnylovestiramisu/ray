@@ -37,6 +37,11 @@ _USER_AGENT = "ray-sandbox/1.0 (python-urllib)"
 # representation: files keep their real owners and in-sandbox chown works for
 # any uid, all from an unprivileged worker.
 ROOTFS_IMAGE = "rootfs.erofs"
+# An image that an image provider plugin streams has its own cache entry,
+# ``<cache name>.streamed``, next to the EROFS one, holding this metadata file
+# and the image config instead of ``rootfs.erofs``.
+STREAMED_DIR_SUFFIX = ".streamed"
+STREAMED_MARKER = ".streamed.json"
 # Cache format recorded in each image's ``.extracted`` marker. A mismatch (an
 # extracted-directory cache left by an earlier Ray, say) re-pulls the image
 # once; sandboxes already running on the old cache keep it until they exit.
@@ -1015,7 +1020,8 @@ def evict_least_recently_used_images(
     Nodes cache every image they ever ran, so without a cap a long-lived
     node eventually fills its disk, and the cache also gives way when
     sandboxes' overlays or anything else fill it. Candidates are fully extracted images
-    (``.extracted`` marker present) and ``<name>.tar`` archives left behind
+    (``.extracted`` marker present), streamed images' metadata entries
+    (``.streamed.json`` present), and ``<name>.tar`` archives left behind
     by earlier Ray versions, oldest first. An image is skipped when a live sandbox uses it, when its
     per-image lock is held (a pull in progress), or when it is ``keep``. The
     in-use check is repeated under the lock, which is also where pulls
@@ -1057,6 +1063,12 @@ def evict_least_recently_used_images(
         if name.startswith("."):
             continue
         marker = os.path.join(path, ".extracted")
+        if name.endswith(STREAMED_DIR_SUFFIX):
+            # A streamed image's entry holds only metadata; its rootfs belongs
+            # to the image provider plugin and lives outside the cache, so
+            # deleting the entry never touches it. Each of the entry's users
+            # holds a plugin lease, and only an entry without users goes.
+            marker = os.path.join(path, STREAMED_MARKER)
         try:
             if not (os.path.isdir(path) and os.path.exists(marker)):
                 continue

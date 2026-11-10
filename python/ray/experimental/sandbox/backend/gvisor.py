@@ -862,9 +862,17 @@ class GVisorSandboxBackend(BaseSandboxBackend):
         if _caps_workdir(config):
             # gVisor's --overlay2 layer keeps the capped workdir's writes here.
             os.makedirs(os.path.join(root_dir, _OVERLAY2_DIRNAME), exist_ok=True)
-        if not overlayfs.needs_rootfs_overlay(spec):
+        if not overlayfs.needs_rootfs_overlay_for_image(
+            spec, self._streamed_rootfs_dir(config.image)
+        ):
             return None
         return self._prepare_rootfs_overlay(config, spec, root_dir)
+
+    def _streamed_rootfs_dir(self, image: str) -> Optional[str]:
+        """The image provider plugin's rootfs directory for ``image``, or None
+        if the sandbox boots from an EROFS image."""
+        get_dir = getattr(self._image_manager, "get_streamed_rootfs_dir", None)
+        return get_dir(image) if get_dir is not None else None
 
     def _launch_sandbox(
         self,
@@ -2195,8 +2203,11 @@ class GVisorSandboxBackend(BaseSandboxBackend):
         It runs after the bundle is written, since the kernel overlay mounts
         on root.path as written in its final ``spec``.
         """
-        # The kernel overlay sits on the image's cached EROFS image.
-        image = self._image_manager.get_rootfs_image(config.image)
+        # The kernel overlay sits on the image's cached EROFS image, or on the
+        # rootfs directory an image provider plugin streams.
+        streamed_rootfs = self._streamed_rootfs_dir(config.image)
+        if streamed_rootfs is None:
+            image = self._image_manager.get_rootfs_image(config.image)
 
         # root.path reflects any _oci_spec_transform_fn. A relative root.path
         # resolves against the bundle.
@@ -2207,6 +2218,13 @@ class GVisorSandboxBackend(BaseSandboxBackend):
         # with the bundle.
         os.makedirs(os.path.join(root_dir, _OVERLAY2_DIRNAME), exist_ok=True)
 
+        if streamed_rootfs is not None:
+            return overlayfs.prepare(
+                image=streamed_rootfs,
+                mountpoint=mountpoint,
+                bundle_dir=root_dir,
+                image_mount_mode=overlayfs.ImageMountMode.DIRECTORY,
+            )
         return overlayfs.prepare(
             image=image,
             mountpoint=mountpoint,

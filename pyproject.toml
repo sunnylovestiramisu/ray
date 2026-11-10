@@ -26,6 +26,7 @@ extend-exclude = [
     "python/ray/rllib/examples/envs/classes/multi_agent/footsies/game/proto/footsies_service_pb2_grpc.py",
     "python/ray/experimental/sandbox/http/_proto/*_pb2.py",
     "python/ray/experimental/sandbox/http/_proto/*_grpc.py",
+    "python/ray/experimental/sandbox/_internal/image_provider_pb2*.py",
 ]
 
 [tool.ruff.lint]

@@ -1,16 +1,27 @@
 import copy
+import fcntl
 import json
 import logging
 import os
 import subprocess
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from ray.experimental.sandbox._internal import cdi, cdi_lib, overlayfs
+from ray.experimental.sandbox._internal import (
+    cdi,
+    cdi_lib,
+    image_provider_client as image_provider,
+    overlayfs,
+)
 from ray.experimental.sandbox._internal.image_utils import (
+    _USERS_SUBDIR,
     DEFAULT_IMAGES_DIR,
     ROOTFS_IMAGE,
+    STREAMED_DIR_SUFFIX,
+    STREAMED_MARKER,
+    _has_users,
     _release_image_use,
     image_cache_name,
     pull_and_extract_container_image,
@@ -29,6 +40,26 @@ _OCI_CAPABILITY_SETS = ("bounding", "effective", "permitted")
 
 _RESOLV_CONF = "/etc/resolv.conf"
 _ETC_HOSTS = "/etc/hosts"
+
+# How a cached image supplies a sandbox's rootfs: an EROFS image Ray pulls
+# and builds, or a directory an image provider plugin streams.
+MODE_EROFS = "erofs"
+MODE_STREAMED = "streamed"
+_IMAGE_CONFIG_FILE = ".image_config.json"
+# The pin a pull without an instance takes on a streamed image, holding its
+# plugin lease until the first sandbox to pull the image claims it.
+_UNCLAIMED_USER = ".unclaimed"
+
+
+def _is_local_archive(image: str) -> bool:
+    return image.endswith(".tar") or image.startswith(("/", "./", "../"))
+
+
+def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 def get_default_oci_spec() -> Dict[str, Any]:
@@ -281,6 +312,14 @@ class ImageManager(BaseImageManager):
 
     def __init__(self, images_dir: str = DEFAULT_IMAGES_DIR):
         self._images_dir = images_dir
+        # The mode of each image's latest pull in this process, so the spec
+        # for a sandbox uses the rootfs its own pull pinned, even while
+        # another mode's cache entry for the image exists.
+        self._pull_modes: Dict[str, str] = {}
+        # TODO: Send ReconcileImages here once the plugin socket appears, with
+        # the leases the streamed entries' pins record. Every worker on the
+        # node shares the cache, so that needs the image locks to not race
+        # pulls in other workers.
 
     @property
     def images_dir(self) -> str:
@@ -303,24 +342,306 @@ class ImageManager(BaseImageManager):
             timeout_seconds: Timeout for network operations.
             instance_id: The sandbox instance that will use the image.
 
+        If a node-local image provider plugin can stream the image (see
+        ``image_provider_client``), the plugin mounts it and Ray caches only
+        its metadata; each pin then holds one plugin lease. Otherwise, or with
+        ``RAY_SANDBOX_IMAGE_STREAMING=disabled``, Ray pulls the image and
+        builds an EROFS image of it. With ``RAY_SANDBOX_IMAGE_STREAMING=required``
+        a registry image that can't be streamed fails instead.
+
         Returns:
             Absolute directory path containing the extracted container filesystem.
+
+        Raises:
+            SandboxCreationError: If the pull fails.
         """
-        return pull_and_extract_container_image(
+        start = time.monotonic()
+        streaming = image_provider.streaming_mode()
+        if streaming != image_provider.STREAMING_DISABLED and not _is_local_archive(
+            image
+        ):
+            try:
+                image_dir, source, meta = self._pull_streamed_image(
+                    image, timeout_seconds, instance_id
+                )
+            except image_provider.ImageProviderNotSupportedError as err:
+                if streaming == image_provider.STREAMING_REQUIRED:
+                    raise SandboxCreationError(
+                        f"Image '{image}' can't be streamed, and "
+                        f"{image_provider.STREAMING_MODE_ENV}=required: {err}"
+                    ) from err
+                logger.info(
+                    "Not streaming image '%s' (%s); pulling it locally.", image, err
+                )
+            except image_provider.ImageProviderError as err:
+                raise SandboxCreationError(
+                    f"Image provider plugin failed to prepare '{image}': {err}"
+                ) from err
+            else:
+                self._pull_modes[image] = MODE_STREAMED
+                logger.info(
+                    "image_pull mode=%s provider=%s image=%s ms=%.1f source=%s",
+                    MODE_STREAMED,
+                    meta.get("provider") or "unknown",
+                    image,
+                    (time.monotonic() - start) * 1000,
+                    source,
+                )
+                return image_dir
+
+        image_dir = pull_and_extract_container_image(
             image,
             images_dir=self._images_dir,
             timeout_seconds=timeout_seconds,
             instance_id=instance_id,
         )
+        self._pull_modes[image] = MODE_EROFS
+        logger.info(
+            "image_pull mode=%s provider=local image=%s ms=%.1f",
+            MODE_EROFS,
+            image,
+            (time.monotonic() - start) * 1000,
+        )
+        return image_dir
+
+    def _pull_streamed_image(
+        self,
+        image: str,
+        timeout_seconds: float,
+        instance_id: Optional[str],
+    ):
+        """Pin a streamed image, taking a plugin lease unless the pin has one.
+
+        A pin for ``instance_id`` that exists already has its lease. A pull
+        with an instance claims the lease a pull without one left behind
+        (the ``.unclaimed`` pin), and a pull without an instance takes a lease
+        only if no pin holds one, so the image stays mounted until a sandbox
+        claims it.
+
+        Returns:
+            The streamed cache entry's directory, how the pin was satisfied
+            (``hit``, ``claim`` or ``prepare``), and the entry's metadata.
+
+        Raises:
+            ImageProviderNotSupportedError: To fall back to a local pull.
+            ImageProviderError: If PrepareImage failed otherwise.
+        """
+        if not image_provider.available():
+            raise image_provider.ImageProviderNotSupportedError(
+                f"no image provider plugin at {image_provider.socket_path()}"
+            )
+        os.makedirs(self._images_dir, mode=0o777, exist_ok=True)
+        streamed_dir = self.get_streamed_image_dir(image)
+        users_dir = os.path.join(streamed_dir, _USERS_SUBDIR)
+        unclaimed = os.path.join(users_dir, _UNCLAIMED_USER)
+        pin = os.path.join(users_dir, instance_id or _UNCLAIMED_USER)
+        # The lock eviction takes for this entry (see image_utils).
+        with open(f"{streamed_dir}.lock", "w", encoding="utf-8") as f_lock:
+            fcntl.flock(f_lock, fcntl.LOCK_EX)
+            try:
+                meta = self._read_streamed_metadata(streamed_dir, check_rootfs=True)
+                if meta is not None:
+                    if instance_id is None and _has_users(streamed_dir):
+                        return streamed_dir, "hit", meta
+                    if instance_id is not None and os.path.exists(pin):
+                        return streamed_dir, "hit", meta
+                    if instance_id is not None and os.path.exists(unclaimed):
+                        os.replace(unclaimed, pin)
+                        return streamed_dir, "claim", meta
+
+                auth = image_provider.resolve_registry_auth(image)
+                start = time.monotonic()
+                try:
+                    answer = image_provider.can_provide(image, auth=auth)
+                except image_provider.ImageProviderNotSupportedError:
+                    raise
+                except image_provider.ImageProviderError as err:
+                    raise image_provider.ImageProviderNotSupportedError(
+                        str(err)
+                    ) from err
+                can_provide_ms = (time.monotonic() - start) * 1000
+                if not answer.serving:
+                    raise image_provider.ImageProviderNotSupportedError(
+                        f"image provider {answer.provider_name!r} is not serving"
+                    )
+                if not answer.can_provide:
+                    raise image_provider.ImageProviderNotSupportedError(
+                        f"image provider {answer.provider_name!r} can't provide it"
+                    )
+
+                start = time.monotonic()
+                prepared = image_provider.prepare_image(
+                    image, auth=auth, timeout=timeout_seconds
+                )
+                prepare_ms = (time.monotonic() - start) * 1000
+                try:
+                    os.makedirs(streamed_dir, mode=0o755, exist_ok=True)
+                    _write_json_atomic(
+                        os.path.join(streamed_dir, _IMAGE_CONFIG_FILE), prepared.config
+                    )
+                    meta = {
+                        "mode": MODE_STREAMED,
+                        "image_ref": image,
+                        "provider": prepared.provider_name or answer.provider_name,
+                        "image_digest": prepared.image_digest,
+                        "rootfs_dir": prepared.rootfs_dir,
+                        "can_provide_ms": round(can_provide_ms, 3),
+                        "prepare_ms": round(prepare_ms, 3),
+                        "prepared_at": time.time(),
+                    }
+                    _write_json_atomic(
+                        os.path.join(streamed_dir, STREAMED_MARKER), meta
+                    )
+                    # The pin records the reference its lease was taken
+                    # with, which ReleaseImage must repeat exactly.
+                    os.makedirs(users_dir, exist_ok=True)
+                    with open(pin, "w", encoding="utf-8") as f_pin:
+                        f_pin.write(image)
+                except BaseException:
+                    image_provider.release_image(image)
+                    raise
+                return streamed_dir, "prepare", meta
+            finally:
+                fcntl.flock(f_lock, fcntl.LOCK_UN)
 
     def release_image(self, image: str, instance_id: str) -> None:
         """Release an instance's pin on a cached image.
+
+        A pin on a streamed image also releases its image provider lease.
 
         Args:
             image: Container image name or tar path passed to ``pull_image``.
             instance_id: The sandbox instance that no longer uses the image.
         """
-        _release_image_use(self.get_image_dir(image), instance_id)
+        _release_image_use(self._erofs_image_dir(image), instance_id)
+        pin = os.path.join(
+            self.get_streamed_image_dir(image), _USERS_SUBDIR, instance_id
+        )
+        try:
+            with open(pin, "r", encoding="utf-8") as f_pin:
+                lease_ref = f_pin.read().strip() or image
+            # Whoever removes the pin releases its lease, exactly once.
+            os.remove(pin)
+        except OSError:
+            return
+        image_provider.release_image(lease_ref)
+
+    def get_streamed_image_dir(self, image: str) -> str:
+        """The cache entry that holds a streamed image's metadata.
+
+        Args:
+            image: Container image name.
+
+        Returns:
+            Absolute directory path of the entry; it may not exist.
+        """
+        return os.path.join(
+            self._images_dir, image_cache_name(image) + STREAMED_DIR_SUFFIX
+        )
+
+    def _erofs_image_dir(self, image: str) -> str:
+        return os.path.join(self._images_dir, image_cache_name(image))
+
+    @staticmethod
+    def _read_streamed_metadata(
+        streamed_dir: str, check_rootfs: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            with open(
+                os.path.join(streamed_dir, STREAMED_MARKER), "r", encoding="utf-8"
+            ) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(meta, dict) or not meta.get("rootfs_dir"):
+            return None
+        if check_rootfs and not os.path.isdir(meta["rootfs_dir"]):
+            return None
+        return meta
+
+    def image_mode(self, image: str) -> str:
+        """Whether a sandbox on ``image`` boots from an EROFS image or a
+        streamed directory.
+
+        The mode of the image's latest pull in this process, else streamed if
+        a streamed entry with a mounted rootfs exists and streaming isn't
+        disabled.
+
+        Args:
+            image: Container image name or tar path.
+
+        Returns:
+            ``"erofs"`` or ``"streamed"``.
+        """
+        mode = self._pull_modes.get(image)
+        if mode is not None:
+            return mode
+        if (
+            not _is_local_archive(image)
+            and image_provider.streaming_mode() != image_provider.STREAMING_DISABLED
+            and self._read_streamed_metadata(
+                self.get_streamed_image_dir(image), check_rootfs=True
+            )
+            is not None
+        ):
+            return MODE_STREAMED
+        return MODE_EROFS
+
+    def get_streamed_rootfs_dir(self, image: str) -> Optional[str]:
+        """The host rootfs directory a sandbox on ``image`` boots from, if the
+        image is streamed.
+
+        Args:
+            image: Container image name or tar path.
+
+        Returns:
+            The plugin's rootfs directory, or None for an EROFS image.
+        """
+        if self.image_mode(image) != MODE_STREAMED:
+            return None
+        meta = self._read_streamed_metadata(self.get_streamed_image_dir(image))
+        return meta["rootfs_dir"] if meta else None
+
+    def describe_image(self, image: str) -> Dict[str, Any]:
+        """How ``image`` is cached, for benchmarks and debugging.
+
+        Args:
+            image: Container image name or tar path.
+
+        Returns:
+            ``mode``, ``provider``, ``digest``, ``rootfs`` (the streamed
+            directory or the EROFS image), ``pins`` (instance ids, including
+            ``.unclaimed``), ``prepare_ms`` and ``image_dir``.
+        """
+        mode = self.image_mode(image)
+        image_dir = self.get_image_dir(image)
+        try:
+            pins = sorted(os.listdir(os.path.join(image_dir, _USERS_SUBDIR)))
+        except OSError:
+            pins = []
+        info: Dict[str, Any] = {
+            "mode": mode,
+            "provider": None,
+            "digest": None,
+            "rootfs": None,
+            "pins": pins,
+            "prepare_ms": None,
+            "image_dir": image_dir,
+        }
+        if mode == MODE_STREAMED:
+            meta = self._read_streamed_metadata(image_dir) or {}
+            info.update(
+                provider=meta.get("provider"),
+                digest=meta.get("image_digest"),
+                rootfs=meta.get("rootfs_dir"),
+                prepare_ms=meta.get("prepare_ms"),
+            )
+        else:
+            erofs = os.path.join(image_dir, ROOTFS_IMAGE)
+            info.update(
+                provider="local", rootfs=erofs if os.path.isfile(erofs) else None
+            )
+        return info
 
     def get_image_dir(self, image: str) -> str:
         """Get the cached local directory path for an image.
@@ -329,10 +650,13 @@ class ImageManager(BaseImageManager):
             image: Container image name or tar path.
 
         Returns:
-            Absolute directory path for the image cache directory.
+            Absolute directory path for the image cache directory: the
+            streamed entry if the image is streamed (see ``image_mode``),
+            else the EROFS one.
         """
-        safe_name = image_cache_name(image)
-        return os.path.join(self._images_dir, safe_name)
+        if self.image_mode(image) == MODE_STREAMED:
+            return self.get_streamed_image_dir(image)
+        return self._erofs_image_dir(image)
 
     def get_rootfs_image(self, image: str) -> str:
         """Path of the cached image's EROFS root filesystem.
@@ -347,7 +671,7 @@ class ImageManager(BaseImageManager):
             SandboxCreationError: If the image is not in the cache; call
                 ``pull_image`` first.
         """
-        path = os.path.join(self.get_image_dir(image), ROOTFS_IMAGE)
+        path = os.path.join(self._erofs_image_dir(image), ROOTFS_IMAGE)
         if not os.path.isfile(path):
             raise SandboxCreationError(
                 f"Image '{image}' has no cached root filesystem at {path}; "
@@ -362,9 +686,17 @@ class ImageManager(BaseImageManager):
             image: Container image name or tar path.
 
         Returns:
-            True if image directory exists and contains .extracted marker.
+            True if image directory exists and contains .extracted marker,
+            or the image is streamed and its rootfs is mounted.
         """
-        img_dir = self.get_image_dir(image)
+        if self.image_mode(image) == MODE_STREAMED:
+            return (
+                self._read_streamed_metadata(
+                    self.get_streamed_image_dir(image), check_rootfs=True
+                )
+                is not None
+            )
+        img_dir = self._erofs_image_dir(image)
         marker = os.path.join(img_dir, ".extracted")
         return os.path.isdir(img_dir) and os.path.exists(marker)
 
@@ -378,7 +710,7 @@ class ImageManager(BaseImageManager):
             Dictionary representation of container image configuration.
         """
         img_dir = self.get_image_dir(image)
-        config_path = os.path.join(img_dir, ".image_config.json")
+        config_path = os.path.join(img_dir, _IMAGE_CONFIG_FILE)
         if os.path.exists(config_path):
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
@@ -472,9 +804,20 @@ class ImageManager(BaseImageManager):
             else get_default_oci_spec()
         )
 
-        image_dir = self.pull_image(image)
+        # A streamed image's sandbox pulled it already, and holds its lease.
+        streamed_rootfs = self._mounted_streamed_rootfs(image)
+        if streamed_rootfs is not None:
+            image_dir = self.get_streamed_image_dir(image)
+        elif self._pull_modes.get(image) == MODE_EROFS:
+            # Its sandbox pinned the EROFS image; don't ask the plugin.
+            image_dir = pull_and_extract_container_image(
+                image, images_dir=self._images_dir
+            )
+        else:
+            image_dir = self.pull_image(image)
+            streamed_rootfs = self._mounted_streamed_rootfs(image)
         erofs_image = os.path.join(image_dir, ROOTFS_IMAGE)
-        if not os.path.isfile(erofs_image):
+        if streamed_rootfs is None and not os.path.isfile(erofs_image):
             raise SandboxCreationError(
                 f"Cached image '{image}' at {image_dir} has no {ROOTFS_IMAGE}; "
                 "the cache entry is incomplete. Delete it to pull again."
@@ -631,7 +974,7 @@ class ImageManager(BaseImageManager):
         # boots from a kernel overlay instead. A worker that can't mount one
         # runs it on a private writable overlay, whose writes are discarded
         # with it.
-        if self._needs_writable_root_fallback(spec):
+        if self._needs_writable_root_fallback(spec, streamed_rootfs):
             logger.warning(
                 "readonly=True, but this worker can't mount an overlayfs rootfs, "
                 "and runsc cannot create this sandbox's mount points in a "
@@ -644,13 +987,25 @@ class ImageManager(BaseImageManager):
         # gVisor rootfs annotations, and a writable one its private overlay.
         # Whether it does depends on the final spec, including anything the
         # transform added. An overlayfs sandbox instead runs on the kernel
-        # overlay the backend mounts at root.path.
-        if not overlayfs.needs_rootfs_overlay(spec):
+        # overlay the backend mounts at root.path, over the EROFS image or
+        # the streamed rootfs directory.
+        if not overlayfs.needs_rootfs_overlay_for_image(spec, streamed_rootfs):
             annotations = spec.setdefault("annotations", {})
-            annotations["dev.gvisor.spec.rootfs.source"] = erofs_image
-            annotations["dev.gvisor.spec.rootfs.type"] = "erofs"
+            if streamed_rootfs is not None:
+                # gVisor binds the plugin's read-only directory as the root.
+                # It needs both the source and the type, and the writable
+                # layer goes in memory: "self" would put its backing file in
+                # the read-only directory.
+                spec["root"]["path"] = streamed_rootfs
+                annotations["dev.gvisor.spec.rootfs.source"] = streamed_rootfs
+                annotations["dev.gvisor.spec.rootfs.type"] = "bind"
+                overlay_medium = "memory"
+            else:
+                annotations["dev.gvisor.spec.rootfs.source"] = erofs_image
+                annotations["dev.gvisor.spec.rootfs.type"] = "erofs"
+                overlay_medium = "self"
             if not spec["root"].get("readonly"):
-                annotations["dev.gvisor.spec.rootfs.overlay"] = "self"
+                annotations["dev.gvisor.spec.rootfs.overlay"] = overlay_medium
                 if disk_bytes > 0:
                     # gVisor sizes the overlay's upper layer from this
                     # annotation, so writes past it fail with ENOSPC. The
@@ -660,12 +1015,24 @@ class ImageManager(BaseImageManager):
 
         return spec
 
+    def _mounted_streamed_rootfs(self, image: str) -> Optional[str]:
+        if self.image_mode(image) != MODE_STREAMED:
+            return None
+        meta = self._read_streamed_metadata(
+            self.get_streamed_image_dir(image), check_rootfs=True
+        )
+        return meta["rootfs_dir"] if meta else None
+
     @staticmethod
-    def _needs_writable_root_fallback(spec: Dict[str, Any]) -> bool:
+    def _needs_writable_root_fallback(
+        spec: Dict[str, Any], rootfs_dir: Optional[str] = None
+    ) -> bool:
         """Whether a readonly sandbox needs a writable root to boot.
 
         Args:
             spec: The final OCI spec.
+            rootfs_dir: The streamed rootfs directory, or None for an EROFS
+                image.
 
         Returns:
             True if the root is read-only, the spec has no hooks that need a
@@ -677,7 +1044,12 @@ class ImageManager(BaseImageManager):
             return False
         if overlayfs.has_prestart_hooks(spec):
             return False
-        if len(overlayfs.missing_mount_points(spec)) == 0:
+        missing = (
+            overlayfs.missing_mount_points(spec)
+            if rootfs_dir is None
+            else overlayfs.missing_mount_points(spec, rootfs_dir)
+        )
+        if len(missing) == 0:
             return False
         if overlayfs.can_mount_rootfs_overlay():
             return False
