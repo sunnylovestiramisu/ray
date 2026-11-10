@@ -67,8 +67,10 @@ _GCE_TOKEN_URL = (
     "service-accounts/default/token"
 )
 _GCE_METADATA_TIMEOUT_SECONDS = 1.0
-# The username Google registries take an OAuth2 access token with.
-_OAUTH2_ACCESS_TOKEN_USERNAME = "oauth2accesstoken"
+# The username an OAuth2 access token for a Google registry is sent with. The
+# GKE credential provider uses "_token", and Riptide's gcfsd rejects others
+# (e.g. docker-credential-gcr's "_dcgcr_<version>_token").
+_OAUTH2_ACCESS_TOKEN_USERNAME = "_token"
 
 CAN_PROVIDE_TIMEOUT_SECONDS = 2.0
 RELEASE_TIMEOUT_SECONDS = 10.0
@@ -178,7 +180,8 @@ def resolve_registry_auth(image: str, timeout: float = 10.0) -> Optional[Registr
     Uses the node's Docker config the way Ray's own pull does (credential
     helpers, then ``auths``). For Artifact Registry and GCR images without
     Docker config credentials, falls back to the node's GCE service account
-    token from the metadata server, as ``oauth2accesstoken``. Never raises.
+    token from the metadata server, as ``_token``. Access tokens from
+    Docker credential helpers for Google registries are sent as ``_token`` too. Never raises.
 
     Args:
         image: Registry image reference.
@@ -200,9 +203,16 @@ def resolve_registry_auth(image: str, timeout: float = 10.0) -> Optional[Registr
     if creds is not None and (
         creds.username or creds.identity_token or creds.registry_token
     ):
+        username = creds.username
+        if (
+            _is_google_registry(registry)
+            and creds.password
+            and (username.startswith("_dcgcr") or username == "oauth2accesstoken")
+        ):
+            username = _OAUTH2_ACCESS_TOKEN_USERNAME
         return RegistryAuth(
             server_address=registry,
-            username=creds.username,
+            username=username,
             password=creds.password,
             identity_token=creds.identity_token,
             registry_token=creds.registry_token,

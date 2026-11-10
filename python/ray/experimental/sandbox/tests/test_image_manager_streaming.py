@@ -534,11 +534,30 @@ def test_google_registries_fall_back_to_the_metadata_token(monkeypatch, tmp_path
     auth = image_provider_client.resolve_registry_auth(
         "us-docker.pkg.dev/proj/repo/img@sha256:" + "b" * 64
     )
-    assert auth.username == "oauth2accesstoken"
+    assert auth.username == "_token"
     assert auth.password == "fake-metadata-token"
     assert auth.server_address == "us-docker.pkg.dev"
     assert "fake-metadata-token" not in repr(auth)
     assert image_provider_client.resolve_registry_auth("busybox:latest") is None
+
+
+def test_google_registry_helper_usernames_are_normalized_to_token(
+    monkeypatch, tmp_path
+):
+    for helper_user in ("_dcgcr_2_2_1_token", "oauth2accesstoken"):
+        config_dir = tmp_path / helper_user
+        config_dir.mkdir()
+        encoded = base64.b64encode(f"{helper_user}:fake-helper-token".encode()).decode()
+        (config_dir / "config.json").write_text(
+            json.dumps({"auths": {"us-docker.pkg.dev": {"auth": encoded}}})
+        )
+        monkeypatch.setenv("DOCKER_CONFIG", str(config_dir))
+        auth = image_provider_client.resolve_registry_auth(
+            "us-docker.pkg.dev/proj/repo/img@sha256:" + "c" * 64
+        )
+        assert auth.username == "_token"
+        assert auth.password == "fake-helper-token"
+        assert auth.server_address == "us-docker.pkg.dev"
 
 
 if __name__ == "__main__":
