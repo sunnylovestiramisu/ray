@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from collections import Counter
@@ -51,6 +52,7 @@ class FakePlugin(pb_grpc.ImageProviderPluginServicer):
         self.can_provide = True
         self.state = pb.PLUGIN_STATE_SERVING
         self.prepare_error = None
+        self.reconcile_error = None
         self.wrong_form = False
         self.requests = []
         self.leases = Counter()
@@ -85,6 +87,28 @@ class FakePlugin(pb_grpc.ImageProviderPluginServicer):
         self.leases[request.image_ref] -= 1
         return pb.ReleaseImageResponse()
 
+    def ReconcileImages(self, request, context):
+        self.requests.append(("ReconcileImages", request))
+        if self.reconcile_error is not None:
+            context.abort(self.reconcile_error, "fake plugin can't reconcile")
+        self.leases = Counter({a.image_ref: a.ref_count for a in request.active_images})
+        return pb.ReconcileImagesResponse()
+
+    def reconciled(self):
+        """The leases each ReconcileImages call sent, by reference."""
+        return [
+            {a.image_ref: a.ref_count for a in req.active_images}
+            for req in self.calls("ReconcileImages")
+        ]
+
+
+def _serve(fake, sock):
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    pb_grpc.add_ImageProviderPluginServicer_to_server(fake, server)
+    server.add_insecure_port(f"unix://{sock}")
+    server.start()
+    return server
+
 
 @pytest.fixture
 def rootfs_dir(tmp_path):
@@ -103,10 +127,7 @@ def plugin(rootfs_dir, monkeypatch):
     sock_dir = tempfile.mkdtemp(prefix="imgprov-", dir="/tmp")
     sock = os.path.join(sock_dir, "plugin.sock")
     fake = FakePlugin(rootfs_dir)
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    pb_grpc.add_ImageProviderPluginServicer_to_server(fake, server)
-    server.add_insecure_port(f"unix://{sock}")
-    server.start()
+    server = _serve(fake, sock)
     monkeypatch.setenv(image_provider_client.SOCKET_ENV, sock)
     monkeypatch.setenv(image_provider_client.STREAMING_MODE_ENV, "auto")
     monkeypatch.setenv(image_provider_client.GCE_METADATA_AUTH_ENV, "0")
@@ -258,6 +279,149 @@ def test_release_repeats_the_reference_the_lease_was_taken_with(
     mgr.release_image("docker.io/library/python:3.12", "sbx-1")
     assert [r.image_ref for r in plugin.calls("ReleaseImage")] == ["python:3.12"]
     assert plugin.leases["python:3.12"] == 0
+
+
+OTHER_IMAGE = "registry.example.com/team/other:2.0"
+_HOLD_PIN = (
+    "import fcntl, sys\n"
+    "f = open(sys.argv[1])\n"
+    "fcntl.flock(f, fcntl.LOCK_SH)\n"
+    "print('locked', flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
+def _write_pin(images_dir, image, user, rootfs_dir=None):
+    """A pin on a streamed image as another worker's pull writes it, and the
+    entry's metadata if ``rootfs_dir`` is given."""
+    streamed_dir = os.path.join(
+        images_dir,
+        image_utils.image_cache_name(image) + image_utils.STREAMED_DIR_SUFFIX,
+    )
+    users_dir = os.path.join(streamed_dir, image_utils._USERS_SUBDIR)
+    os.makedirs(users_dir, exist_ok=True)
+    if rootfs_dir is not None:
+        with open(os.path.join(streamed_dir, STREAMED_MARKER), "w") as f:
+            json.dump(
+                {"mode": "streamed", "image_ref": image, "rootfs_dir": rootfs_dir}, f
+            )
+        with open(os.path.join(streamed_dir, ".image_config.json"), "w") as f:
+            json.dump({"config": IMAGE_CONFIG}, f)
+    pin = os.path.join(users_dir, user)
+    with open(pin, "w") as f:
+        f.write(image)
+    return pin
+
+
+def _hold_in_another_process(pin):
+    """Hold a pin the way a live worker in another process (or Pod) does."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_PIN, pin],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout.readline().strip() == "locked"
+    return proc
+
+
+def test_first_streamed_pull_reconciles_the_live_pins(
+    tmp_path, plugin, local_pulls, rootfs_dir
+):
+    """ReconcileImages goes out once, before the first lease, with the leases
+    of every live pin on the node, the other workers' included, and without
+    the pins of sandboxes whose workers died."""
+    images_dir = str(tmp_path / "images")
+    live_pin = _write_pin(images_dir, IMAGE, "sbx-other", rootfs_dir=rootfs_dir)
+    dead_pin = _write_pin(images_dir, IMAGE, "sbx-dead")
+    unclaimed_pin = _write_pin(images_dir, IMAGE, ".unclaimed")
+    dead_other_pin = _write_pin(images_dir, OTHER_IMAGE, "sbx-dead-2")
+    # A worker that held a pin and died dropped its lock.
+    dead = _hold_in_another_process(dead_pin)
+    dead.kill()
+    dead.wait()
+    other = _hold_in_another_process(live_pin)
+    unclaimed_holder = _hold_in_another_process(unclaimed_pin)
+    plugin.leases.update({IMAGE: 3, OTHER_IMAGE: 1})
+    try:
+        mgr = ImageManager(images_dir=images_dir)
+        mgr.pull_image(IMAGE, instance_id="sbx-1")
+
+        assert plugin.reconciled() == [{IMAGE: 2}]
+        assert not os.path.exists(dead_pin)
+        assert not os.path.exists(dead_other_pin)
+        assert os.path.exists(live_pin)
+        assert plugin.leases == Counter({IMAGE: 2})
+        # The new sandbox claimed the unclaimed lease; no new lease was taken.
+        assert plugin.calls("PrepareImage") == []
+
+        # Later pulls, from this plugin socket, don't reconcile again.
+        mgr.pull_image(OTHER_IMAGE, instance_id="sbx-2")
+        mgr.release_image(IMAGE, "sbx-1")
+        mgr.pull_image(IMAGE, instance_id="sbx-3")
+        assert len(plugin.calls("ReconcileImages")) == 1
+        assert plugin.leases == Counter({IMAGE: 2, OTHER_IMAGE: 1})
+    finally:
+        for proc in (other, unclaimed_holder):
+            proc.kill()
+            proc.wait()
+
+
+def test_a_new_plugin_socket_is_reconciled_with_this_workers_pins(
+    tmp_path, plugin, local_pulls, rootfs_dir, monkeypatch
+):
+    mgr = ImageManager(images_dir=str(tmp_path / "images"))
+    mgr.pull_image(IMAGE, instance_id="sbx-1")
+    mgr.pull_image(IMAGE)
+    assert plugin.reconciled() == [{}]
+
+    # The plugin restarted, on a new socket, and knows of no leases.
+    sock_dir = tempfile.mkdtemp(prefix="imgprov-", dir="/tmp")
+    restarted = FakePlugin(rootfs_dir)
+    server = _serve(restarted, os.path.join(sock_dir, "plugin.sock"))
+    monkeypatch.setenv(
+        image_provider_client.SOCKET_ENV, os.path.join(sock_dir, "plugin.sock")
+    )
+    try:
+        mgr.pull_image(OTHER_IMAGE, instance_id="sbx-2")
+        # This worker's own pins hold their locks, so they're live.
+        assert restarted.reconciled() == [{IMAGE: 1}]
+        assert restarted.leases == Counter({IMAGE: 1, OTHER_IMAGE: 1})
+    finally:
+        server.stop(None)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "code,retried",
+    [(grpc.StatusCode.UNIMPLEMENTED, False), (grpc.StatusCode.INTERNAL, True)],
+)
+def test_reconcile_errors_never_fail_the_pull(
+    tmp_path, plugin, local_pulls, code, retried
+):
+    images_dir = str(tmp_path / "images")
+    dead_pin = _write_pin(images_dir, OTHER_IMAGE, "sbx-dead")
+    plugin.reconcile_error = code
+    mgr = ImageManager(images_dir=images_dir)
+    assert mgr.pull_image(IMAGE, instance_id="sbx-1") == mgr.get_streamed_image_dir(
+        IMAGE
+    )
+    assert plugin.leases[IMAGE] == 1
+    # The plugin may still hold the dead pin's lease, so the pin stays.
+    assert os.path.exists(dead_pin)
+
+    mgr.pull_image(IMAGE, instance_id="sbx-2")
+    assert len(plugin.calls("ReconcileImages")) == (2 if retried else 1)
+    assert plugin.leases[IMAGE] == 2
+
+
+def test_reconcile_can_be_disabled(tmp_path, plugin, local_pulls, monkeypatch):
+    monkeypatch.setenv(image_manager_mod.RECONCILE_ENV, "0")
+    images_dir = str(tmp_path / "images")
+    dead_pin = _write_pin(images_dir, OTHER_IMAGE, "sbx-dead")
+    ImageManager(images_dir=images_dir).pull_image(IMAGE, instance_id="sbx-1")
+    assert plugin.calls("ReconcileImages") == []
+    assert os.path.exists(dead_pin)
 
 
 def test_missing_socket_falls_back(tmp_path, local_pulls, monkeypatch):

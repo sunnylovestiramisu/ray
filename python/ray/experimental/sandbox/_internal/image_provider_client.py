@@ -9,8 +9,9 @@ host. A sandbox then boots from that directory instead of from an EROFS image
 that Ray pulls and builds itself.
 
 Every successful ``PrepareImage`` takes one lease on the image, and every
-``ReleaseImage`` drops one. The functions here are stateless; the image
-manager maps leases to sandboxes.
+``ReleaseImage`` drops one. ``ReconcileImages`` replaces all of the plugin's
+leases at once. The functions here are stateless; the image manager maps
+leases to sandboxes.
 
 The client never logs registry credentials.
 
@@ -74,6 +75,7 @@ _OAUTH2_ACCESS_TOKEN_USERNAME = "_token"
 
 CAN_PROVIDE_TIMEOUT_SECONDS = 2.0
 RELEASE_TIMEOUT_SECONDS = 10.0
+RECONCILE_TIMEOUT_SECONDS = 30.0
 
 
 class ImageProviderError(RuntimeError):
@@ -378,3 +380,49 @@ def release_image(
             "ReleaseImage failed for %s: %s: %s", image, err.code().name, err.details()
         )
         return False
+
+
+def reconcile_images(
+    leases: Dict[str, int],
+    path: Optional[str] = None,
+    timeout: float = RECONCILE_TIMEOUT_SECONDS,
+) -> None:
+    """Replace all of the plugin's leases with ``leases``.
+
+    The plugin drops, and unmounts, every image that ``leases`` leaves out,
+    whoever leased it, so ``leases`` must hold every lease on the node.
+
+    Args:
+        leases: The number of leases on each image, by the reference each
+            was taken with.
+        path: The plugin's socket (see ``socket_path``).
+        timeout: RPC timeout in seconds.
+
+    Raises:
+        ImageProviderNotSupportedError: If there's no plugin socket or grpc,
+            or the plugin answers UNIMPLEMENTED.
+        ImageProviderError: If the RPC fails otherwise.
+    """
+    if not available(path):
+        raise ImageProviderNotSupportedError(
+            f"No image provider plugin at {socket_path(path)}"
+        )
+    request = image_provider_pb2.ReconcileImagesRequest(
+        active_images=[
+            image_provider_pb2.ActiveImageLayers(image_ref=ref, ref_count=count)
+            for ref, count in sorted(leases.items())
+            if count > 0
+        ]
+    )
+    try:
+        with _channel(path) as channel:
+            stub = image_provider_pb2_grpc.ImageProviderPluginStub(channel)
+            stub.ReconcileImages(request, timeout=timeout)
+    except grpc.RpcError as err:
+        code = err.code()
+        error = (
+            ImageProviderNotSupportedError
+            if code == grpc.StatusCode.UNIMPLEMENTED
+            else ImageProviderError
+        )
+        raise error(f"ReconcileImages failed: {code.name}: {err.details()}") from err

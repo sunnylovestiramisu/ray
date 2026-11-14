@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import fcntl
 import json
@@ -5,6 +6,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -49,6 +51,13 @@ _IMAGE_CONFIG_FILE = ".image_config.json"
 # The pin a pull without an instance takes on a streamed image, holding its
 # plugin lease until the first sandbox to pull the image claims it.
 _UNCLAIMED_USER = ".unclaimed"
+# A lock in the images directory that streamed pulls and releases hold shared
+# and ReconcileImages holds exclusive, so the pins it counts are the leases.
+_LEASES_LOCK = ".image-provider-leases.lock"
+_RECONCILE_LOCK_TIMEOUT_SECONDS = 30.0
+# Set to 0 to never send ReconcileImages, e.g. when other clients whose pins
+# this images directory doesn't hold use the same plugin.
+RECONCILE_ENV = "RAY_SANDBOX_IMAGE_PROVIDER_RECONCILE"
 
 
 def _is_local_archive(image: str) -> bool:
@@ -60,6 +69,30 @@ def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def _flock(path: str, operation: int, timeout: Optional[float] = None):
+    """Hold ``flock(operation)`` on ``path``, waiting at most ``timeout``
+    seconds for it if given."""
+    # Read-only, so a process of another user can lock it too.
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_CREAT, 0o666)) as f:
+        if timeout is None:
+            fcntl.flock(f, operation)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(f, operation | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out waiting for {path}")
+                    time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def get_default_oci_spec() -> Dict[str, Any]:
@@ -316,10 +349,13 @@ class ImageManager(BaseImageManager):
         # for a sandbox uses the rootfs its own pull pinned, even while
         # another mode's cache entry for the image exists.
         self._pull_modes: Dict[str, str] = {}
-        # TODO: Send ReconcileImages here once the plugin socket appears, with
-        # the leases the streamed entries' pins record. Every worker on the
-        # node shares the cache, so that needs the image locks to not race
-        # pulls in other workers.
+        # The pins of streamed images this process holds, each open with a
+        # shared lock, so ReconcileImages tells live pins from dead ones.
+        self._pin_locks: Dict[str, Any] = {}
+        # The plugin socket (st_dev, st_ino) leases were reconciled with; a
+        # restarted plugin makes a new one.
+        self._reconciled_socket: Optional[tuple] = None
+        self._reconcile_lock = threading.Lock()
 
     @property
     def images_dir(self) -> str:
@@ -347,7 +383,9 @@ class ImageManager(BaseImageManager):
         its metadata; each pin then holds one plugin lease. Otherwise, or with
         ``RAY_SANDBOX_IMAGE_STREAMING=disabled``, Ray pulls the image and
         builds an EROFS image of it. With ``RAY_SANDBOX_IMAGE_STREAMING=required``
-        a registry image that can't be streamed fails instead.
+        a registry image that can't be streamed fails instead. The first
+        streamed pull from each plugin socket first reconciles the plugin's
+        leases with the live pins (see ``_maybe_reconcile_leases``).
 
         Returns:
             Absolute directory path containing the extracted container filesystem.
@@ -431,6 +469,17 @@ class ImageManager(BaseImageManager):
                 f"no image provider plugin at {image_provider.socket_path()}"
             )
         os.makedirs(self._images_dir, mode=0o777, exist_ok=True)
+        self._maybe_reconcile_leases()
+        with self._leases_lock(fcntl.LOCK_SH):
+            return self._pin_streamed_image(image, timeout_seconds, instance_id)
+
+    def _pin_streamed_image(
+        self,
+        image: str,
+        timeout_seconds: float,
+        instance_id: Optional[str],
+    ):
+        """``_pull_streamed_image``, under the leases lock."""
         streamed_dir = self.get_streamed_image_dir(image)
         users_dir = os.path.join(streamed_dir, _USERS_SUBDIR)
         unclaimed = os.path.join(users_dir, _UNCLAIMED_USER)
@@ -444,9 +493,14 @@ class ImageManager(BaseImageManager):
                     if instance_id is None and _has_users(streamed_dir):
                         return streamed_dir, "hit", meta
                     if instance_id is not None and os.path.exists(pin):
+                        self._hold_pin(pin)
                         return streamed_dir, "hit", meta
                     if instance_id is not None and os.path.exists(unclaimed):
                         os.replace(unclaimed, pin)
+                        held = self._pin_locks.pop(unclaimed, None)
+                        if held is not None:
+                            self._pin_locks[pin] = held
+                        self._hold_pin(pin)
                         return streamed_dir, "claim", meta
 
                 auth = image_provider.resolve_registry_auth(image)
@@ -500,9 +554,133 @@ class ImageManager(BaseImageManager):
                 except BaseException:
                     image_provider.release_image(image)
                     raise
+                self._hold_pin(pin)
                 return streamed_dir, "prepare", meta
             finally:
                 fcntl.flock(f_lock, fcntl.LOCK_UN)
+
+    def _hold_pin(self, pin: str) -> None:
+        """Hold a shared lock on a streamed image's pin until it's released.
+
+        The kernel drops the lock when this process exits, so
+        ``_maybe_reconcile_leases`` in any process on the node (any pod that
+        mounts the same images directory too) can tell the pins of live
+        sandboxes from the pins that dead ones left behind.
+        """
+        held = self._pin_locks.get(pin)
+        if held is not None:
+            try:
+                if os.path.samestat(os.fstat(held.fileno()), os.stat(pin)):
+                    return
+            except OSError:
+                pass
+            held.close()
+        f_pin = open(pin, "r", encoding="utf-8")
+        try:
+            fcntl.flock(f_pin, fcntl.LOCK_SH)
+        except BaseException:
+            f_pin.close()
+            raise
+        self._pin_locks[pin] = f_pin
+
+    def _leases_lock(self, operation: int, timeout: Optional[float] = None):
+        """Hold the images directory's leases lock (see ``_LEASES_LOCK``).
+
+        Args:
+            operation: ``fcntl.LOCK_SH`` or ``fcntl.LOCK_EX``.
+            timeout: Seconds to wait for the lock; None waits forever.
+
+        Returns:
+            A context manager that holds the lock.
+
+        Raises:
+            TimeoutError: If ``timeout`` seconds pass before it's free.
+        """
+        return _flock(os.path.join(self._images_dir, _LEASES_LOCK), operation, timeout)
+
+    def _maybe_reconcile_leases(self) -> None:
+        """Send ReconcileImages once per plugin socket, with the live pins'
+        leases.
+
+        ``ReconcileImages`` replaces all of the plugin's leases, so it gets
+        every lease that a live sandbox on the node still holds: the pins of
+        every streamed entry in the images directory that some process holds
+        locked (see ``_hold_pin``). The pins that nobody holds were left by
+        sandboxes that died with their worker or Pod; they're dropped, and
+        the plugin then drops their leases and unmounts the images that no
+        live sandbox uses. The leases lock keeps pulls and releases in every
+        process from changing pins and leases meanwhile.
+
+        A plugin that doesn't implement it, or fails, never fails the pull.
+        """
+        if os.environ.get(RECONCILE_ENV, "1").strip().lower() in ("0", "false", "no"):
+            return
+        try:
+            st = os.stat(image_provider.socket_path())
+        except OSError:
+            return
+        socket_id = (st.st_dev, st.st_ino)
+        if self._reconciled_socket == socket_id:
+            return
+        with self._reconcile_lock:
+            if self._reconciled_socket == socket_id:
+                return
+            try:
+                with self._leases_lock(
+                    fcntl.LOCK_EX, timeout=_RECONCILE_LOCK_TIMEOUT_SECONDS
+                ):
+                    leases, dead_pins = self._live_streamed_leases()
+                    image_provider.reconcile_images(leases)
+                    for pin in dead_pins:
+                        try:
+                            os.remove(pin)
+                        except OSError:
+                            pass
+            except image_provider.ImageProviderNotSupportedError as err:
+                logger.info("Not reconciling image provider leases: %s", err)
+            except (image_provider.ImageProviderError, OSError) as err:
+                # Retried by the next streamed pull.
+                logger.warning("Failed to reconcile image provider leases: %s", err)
+                return
+            else:
+                logger.info(
+                    "Reconciled image provider leases: %s; dropped %d dead pins",
+                    leases,
+                    len(dead_pins),
+                )
+            self._reconciled_socket = socket_id
+
+    def _live_streamed_leases(self):
+        """The leases that the streamed entries' live pins hold, by reference,
+        and the paths of the pins that no live process holds."""
+        leases: Dict[str, int] = {}
+        dead_pins: List[str] = []
+        for name in os.listdir(self._images_dir):
+            if name.startswith(".") or not name.endswith(STREAMED_DIR_SUFFIX):
+                continue
+            streamed_dir = os.path.join(self._images_dir, name)
+            users_dir = os.path.join(streamed_dir, _USERS_SUBDIR)
+            try:
+                pins = os.listdir(users_dir)
+            except OSError:
+                continue
+            meta = self._read_streamed_metadata(streamed_dir) or {}
+            for user in pins:
+                pin = os.path.join(users_dir, user)
+                try:
+                    f_pin = open(pin, "r", encoding="utf-8")
+                except OSError:
+                    continue
+                with f_pin:
+                    try:
+                        fcntl.flock(f_pin, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        lease_ref = f_pin.read().strip() or meta.get("image_ref")
+                        if lease_ref:
+                            leases[lease_ref] = leases.get(lease_ref, 0) + 1
+                    else:
+                        dead_pins.append(pin)
+        return leases, dead_pins
 
     def release_image(self, image: str, instance_id: str) -> None:
         """Release an instance's pin on a cached image.
@@ -517,14 +695,21 @@ class ImageManager(BaseImageManager):
         pin = os.path.join(
             self.get_streamed_image_dir(image), _USERS_SUBDIR, instance_id
         )
-        try:
-            with open(pin, "r", encoding="utf-8") as f_pin:
-                lease_ref = f_pin.read().strip() or image
-            # Whoever removes the pin releases its lease, exactly once.
-            os.remove(pin)
-        except OSError:
+        if not os.path.exists(pin):
             return
-        image_provider.release_image(lease_ref)
+        with self._leases_lock(fcntl.LOCK_SH):
+            try:
+                with open(pin, "r", encoding="utf-8") as f_pin:
+                    lease_ref = f_pin.read().strip() or image
+                # Whoever removes the pin releases its lease, exactly once.
+                os.remove(pin)
+            except OSError:
+                return
+            finally:
+                held = self._pin_locks.pop(pin, None)
+                if held is not None:
+                    held.close()
+            image_provider.release_image(lease_ref)
 
     def get_streamed_image_dir(self, image: str) -> str:
         """The cache entry that holds a streamed image's metadata.
