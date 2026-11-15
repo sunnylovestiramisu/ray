@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from ray.experimental.sandbox._internal import (
     cdi,
@@ -55,6 +55,14 @@ _UNCLAIMED_USER = ".unclaimed"
 # and ReconcileImages holds exclusive, so the pins it counts are the leases.
 _LEASES_LOCK = ".image-provider-leases.lock"
 _RECONCILE_LOCK_TIMEOUT_SECONDS = 30.0
+# Records, in the images directory, the plugin socket that the node's pins were
+# last reconciled with, so the many ImageManagers on a node (one per thread or
+# process) don't each send ReconcileImages, which holds the leases lock
+# exclusive and so stalls every streamed pull on the node.
+_RECONCILED_MARKER = ".image-provider-reconciled"
+# (images_dir, socket) pairs this process has already checked.
+_reconciled_in_process: Set[Tuple[str, Tuple[int, int]]] = set()
+_reconciled_in_process_lock = threading.Lock()
 # Set to 0 to never send ReconcileImages, e.g. when other clients whose pins
 # this images directory doesn't hold use the same plugin.
 RECONCILE_ENV = "RAY_SANDBOX_IMAGE_PROVIDER_RECONCILE"
@@ -354,8 +362,6 @@ class ImageManager(BaseImageManager):
         self._pin_locks: Dict[str, Any] = {}
         # The plugin socket (st_dev, st_ino) leases were reconciled with; a
         # restarted plugin makes a new one.
-        self._reconciled_socket: Optional[tuple] = None
-        self._reconcile_lock = threading.Lock()
 
     @property
     def images_dir(self) -> str:
@@ -599,8 +605,7 @@ class ImageManager(BaseImageManager):
         return _flock(os.path.join(self._images_dir, _LEASES_LOCK), operation, timeout)
 
     def _maybe_reconcile_leases(self) -> None:
-        """Send ReconcileImages once per plugin socket, with the live pins'
-        leases.
+        """Send ReconcileImages when the node's pins and the plugin may differ.
 
         ``ReconcileImages`` replaces all of the plugin's leases, so it gets
         every lease that a live sandbox on the node still holds: the pins of
@@ -611,6 +616,10 @@ class ImageManager(BaseImageManager):
         live sandbox uses. The leases lock keeps pulls and releases in every
         process from changing pins and leases meanwhile.
 
+        It goes out once per node and plugin socket, plus whenever pins of
+        dead owners show up (a worker or Pod restarted). Each process checks
+        once per plugin socket, whatever number of ImageManagers it has.
+
         A plugin that doesn't implement it, or fails, never fails the pull.
         """
         if os.environ.get(RECONCILE_ENV, "1").strip().lower() in ("0", "false", "no"):
@@ -620,35 +629,76 @@ class ImageManager(BaseImageManager):
         except OSError:
             return
         socket_id = (st.st_dev, st.st_ino)
-        if self._reconciled_socket == socket_id:
+        key = (self._images_dir, socket_id)
+        if key in _reconciled_in_process:
             return
-        with self._reconcile_lock:
-            if self._reconciled_socket == socket_id:
+        with _reconciled_in_process_lock:
+            if key in _reconciled_in_process:
                 return
-            try:
-                with self._leases_lock(
-                    fcntl.LOCK_EX, timeout=_RECONCILE_LOCK_TIMEOUT_SECONDS
-                ):
-                    leases, dead_pins = self._live_streamed_leases()
-                    image_provider.reconcile_images(leases)
-                    for pin in dead_pins:
-                        try:
-                            os.remove(pin)
-                        except OSError:
-                            pass
-            except image_provider.ImageProviderNotSupportedError as err:
-                logger.info("Not reconciling image provider leases: %s", err)
-            except (image_provider.ImageProviderError, OSError) as err:
-                # Retried by the next streamed pull.
-                logger.warning("Failed to reconcile image provider leases: %s", err)
-                return
-            else:
-                logger.info(
-                    "Reconciled image provider leases: %s; dropped %d dead pins",
-                    leases,
-                    len(dead_pins),
+            if self._reconcile_leases(socket_id):
+                _reconciled_in_process.add(key)
+
+    def _reconciled_socket_on_node(self) -> Optional[Tuple[int, int]]:
+        try:
+            with open(
+                os.path.join(self._images_dir, _RECONCILED_MARKER), encoding="utf-8"
+            ) as f:
+                dev, ino = f.read().strip().split(":")
+            return (int(dev), int(ino))
+        except (OSError, ValueError):
+            return None
+
+    def _reconcile_leases(self, socket_id: Tuple[int, int]) -> bool:
+        """Reconcile the plugin's leases with the node's live pins if needed.
+
+        Args:
+            socket_id: The plugin socket's (st_dev, st_ino).
+
+        Returns:
+            False if it failed and the next streamed pull should try again.
+        """
+        # Without the exclusive lock first: if the node already reconciled
+        # with this plugin and no pin's owner has died since, skip it. A pin
+        # being written can look dead here; the check under the lock decides.
+        if self._reconciled_socket_on_node() == socket_id:
+            if not self._live_streamed_leases()[1]:
+                return True
+        try:
+            with self._leases_lock(
+                fcntl.LOCK_EX, timeout=_RECONCILE_LOCK_TIMEOUT_SECONDS
+            ):
+                leases, dead_pins = self._live_streamed_leases()
+                if self._reconciled_socket_on_node() == socket_id and not dead_pins:
+                    return True
+                image_provider.reconcile_images(leases)
+                for pin in dead_pins:
+                    try:
+                        os.remove(pin)
+                    except OSError:
+                        pass
+                with open(
+                    os.path.join(self._images_dir, _RECONCILED_MARKER + ".tmp"),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(f"{socket_id[0]}:{socket_id[1]}")
+                os.replace(
+                    os.path.join(self._images_dir, _RECONCILED_MARKER + ".tmp"),
+                    os.path.join(self._images_dir, _RECONCILED_MARKER),
                 )
-            self._reconciled_socket = socket_id
+        except image_provider.ImageProviderNotSupportedError as err:
+            logger.info("Not reconciling image provider leases: %s", err)
+            return True
+        except (image_provider.ImageProviderError, OSError) as err:
+            # Retried by the next streamed pull.
+            logger.warning("Failed to reconcile image provider leases: %s", err)
+            return False
+        logger.info(
+            "Reconciled image provider leases: %d images; dropped %d dead pins",
+            len(leases),
+            len(dead_pins),
+        )
+        return True
 
     def _live_streamed_leases(self):
         """The leases that the streamed entries' live pins hold, by reference,

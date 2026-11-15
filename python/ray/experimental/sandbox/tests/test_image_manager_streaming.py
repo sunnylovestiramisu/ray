@@ -392,6 +392,50 @@ def test_a_new_plugin_socket_is_reconciled_with_this_workers_pins(
         shutil.rmtree(sock_dir, ignore_errors=True)
 
 
+def test_image_managers_on_a_reconciled_node_skip_reconcile(
+    tmp_path, plugin, local_pulls, rootfs_dir, monkeypatch
+):
+    """ReconcileImages holds the leases lock exclusive, which stalls every
+    streamed pull on the node, so the many ImageManagers on a node (one per
+    thread or process) send it once per plugin socket."""
+    images_dir = str(tmp_path / "images")
+    # Keep the managers, and so the locks on their pins, alive.
+    mgrs = [ImageManager(images_dir=images_dir) for _ in range(5)]
+    for i, mgr in enumerate(mgrs):
+        mgr.pull_image(IMAGE, instance_id=f"sbx-{i}")
+    assert len(plugin.calls("ReconcileImages")) == 1
+
+    # Another process on the node has no record of its own; it finds the
+    # node already reconciled with this plugin and no dead pins.
+    monkeypatch.setattr(image_manager_mod, "_reconciled_in_process", set())
+    ImageManager(images_dir=images_dir).pull_image(OTHER_IMAGE, instance_id="sbx-x")
+    assert len(plugin.calls("ReconcileImages")) == 1
+
+
+def test_dead_pins_on_a_reconciled_node_are_reconciled_again(
+    tmp_path, plugin, local_pulls, rootfs_dir, monkeypatch
+):
+    """A worker or Pod that restarts leaves pins of dead owners on a node that
+    already reconciled with the plugin; the next process reconciles again."""
+    images_dir = str(tmp_path / "images")
+    mgr = ImageManager(images_dir=images_dir)
+    mgr.pull_image(IMAGE, instance_id="sbx-1")
+    assert len(plugin.calls("ReconcileImages")) == 1
+
+    dead_pin = _write_pin(images_dir, OTHER_IMAGE, "sbx-dead")
+    plugin.leases[OTHER_IMAGE] = 1
+    dead = _hold_in_another_process(dead_pin)
+    dead.kill()
+    dead.wait()
+
+    monkeypatch.setattr(image_manager_mod, "_reconciled_in_process", set())
+    ImageManager(images_dir=images_dir).pull_image(IMAGE, instance_id="sbx-2")
+    # sbx-1's pin is still held by ``mgr``, so it's live.
+    assert plugin.reconciled()[-1] == {IMAGE: 1}
+    assert not os.path.exists(dead_pin)
+    assert plugin.leases == Counter({IMAGE: 2})
+
+
 @pytest.mark.parametrize(
     "code,retried",
     [(grpc.StatusCode.UNIMPLEMENTED, False), (grpc.StatusCode.INTERNAL, True)],
